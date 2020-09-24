@@ -49,7 +49,9 @@ func Generate(options Options, schema Schema, writer io.Writer, tsWriter io.Writ
 }
 
 func doGenerate(options Options, schema Schema, writer *innerWriter) error {
-	fmt.Fprintln(writer, `function dataLengthError(actual, required) {
+	fmt.Fprintln(writer, `// @flow
+
+function dataLengthError(actual, required) {
     throw new Error(`+"`"+`Invalid data length! Required: ${required}, actual: ${actual}`+"`"+`);
 }
 
@@ -59,7 +61,20 @@ function assertDataLength(actual, required) {
   }
 }
 
-function assertArrayBuffer(reader) {
+function assertArrayBuffer(reader, padTo) {
+  if (typeof reader === "string") {
+	  reader = reader.replace(/^0x/,"")
+	  if(reader.length % 2 == 1) reader = reader.padStart(reader.length+1, "0");
+	  if(padTo !== undefined) reader = reader.padEnd(padTo*2, "0");
+	  reader = Buffer.from(reader, 'hex');
+	  reader = reader.buffer.slice(reader.byteOffset,reader.byteOffset+reader.byteLength);
+  }
+  if (BigInt && reader instanceof BigInt) {
+	  var tmp = new ArrayBuffer(padTo);
+	  var tmpDV = new DataView(tmp);
+	  tmpDV.setBigUint64(0, value, true);
+          return tmp;
+  }
   if (reader instanceof Object && reader.toArrayBuffer instanceof Function) {
     reader = reader.toArrayBuffer();
   }
@@ -108,6 +123,26 @@ function verifyAndExtractOffsets(view, expectedFieldCount, compatible) {
   return offsets;
 }
 
+function fromStringEnum(val) {
+  switch(typeof val) {
+  case "string":
+    switch(val.toLowerCase()) {
+    case "code":
+    case "data":
+      return 0;
+    case "dep_group":
+    case "type":
+      return 1;
+    default:
+    throw new Error("Not a valid byte representation: "+val);
+    }
+  case "number":
+    return val;
+  default:
+    throw new Error("Not a valid byte representation: "+val);
+  }
+}
+
 function serializeTable(buffers) {
   const itemCount = buffers.length;
   let totalSize = 4 * (itemCount + 1);
@@ -128,9 +163,11 @@ function serializeTable(buffers) {
     array.set(new Uint8Array(buffers[i]), offsets[i]);
   }
   return buffer;
-}`)
+}
+`)
 	fmt.Fprintln(writer)
 	for _, declaration := range schema.Declarations {
+    fmt.Fprintln(writer, "");
 		fmt.Fprintf(writer, "export class %s {\n", declaration.Name)
 		fmt.Fprintln(writer, "  constructor(reader, { validate = true } = {}) {")
 		fmt.Fprintln(writer, "    this.view = new DataView(assertArrayBuffer(reader));")
@@ -142,7 +179,7 @@ function serializeTable(buffers) {
 		switch declaration.Type {
 		case "array":
 			if declaration.Item == "byte" {
-				fmt.Fprintln(writer, "  validate(compatible = false) {")
+				fmt.Fprintln(writer, "  validate(_compatible) {")
 				fmt.Fprintf(writer, "    assertDataLength(this.view.byteLength, %d);\n", declaration.ItemCount)
 				fmt.Fprintln(writer, "  }")
 				fmt.Fprintln(writer)
@@ -164,6 +201,10 @@ function serializeTable(buffers) {
 					fmt.Fprintln(writer, "    return this.view.getUint16(0, true);")
 					fmt.Fprintln(writer, "  }")
 					fmt.Fprintln(writer)
+					fmt.Fprintln(writer, "  toObject() {")
+					fmt.Fprintln(writer, "    return this.toLittleEndianUint16();")
+					fmt.Fprintln(writer, "  }");
+					fmt.Fprintln(writer)
 				case 4:
 					fmt.Fprintln(writer, "  toBigEndianUint32() {")
 					fmt.Fprintln(writer, "    return this.view.getUint32(0, false);")
@@ -173,6 +214,10 @@ function serializeTable(buffers) {
 					fmt.Fprintln(writer, "    return this.view.getUint32(0, true);")
 					fmt.Fprintln(writer, "  }")
 					fmt.Fprintln(writer)
+					fmt.Fprintln(writer, "  toObject() {")
+					fmt.Fprintln(writer, "    return this.toLittleEndianUint32();")
+					fmt.Fprintln(writer, "  }");
+					fmt.Fprintln(writer)
 				case 8:
 					if options.HasBigInt {
 						fmt.Fprintln(writer, "  toBigEndianBigUint64() {")
@@ -180,10 +225,22 @@ function serializeTable(buffers) {
 						fmt.Fprintln(writer, "  }")
 						fmt.Fprintln(writer)
 						fmt.Fprintln(writer, "  toLittleEndianBigUint64() {")
-						fmt.Fprintln(writer, "    return this.view.getUint64(0, true);")
+						fmt.Fprintln(writer, "    return this.view.getBigUint64(0, true);")
 						fmt.Fprintln(writer, "  }")
 						fmt.Fprintln(writer)
+						fmt.Fprintln(writer, "  toObject() {")
+						fmt.Fprintln(writer, "    return this.toLittleEndianBigUint64();")
+						fmt.Fprintln(writer, "  }");
+						fmt.Fprintln(writer)
+					} else {
+						fmt.Fprintln(writer, "  toObject() {")
+						fmt.Fprintln(writer, "    return Buffer.from(this.raw()).toString('hex');")
+						fmt.Fprintln(writer, "  }");
 					}
+				default:
+					fmt.Fprintln(writer, "  toObject() {")
+					fmt.Fprintln(writer, "    return Buffer.from(this.raw()).toString('hex');")
+					fmt.Fprintln(writer, "  }");
 				}
 				fmt.Fprintln(writer, "  static size() {")
 				fmt.Fprintf(writer, "    return %d;\n", declaration.ItemCount)
@@ -204,10 +261,18 @@ function serializeTable(buffers) {
 				fmt.Fprintln(writer, "  static size() {")
 				fmt.Fprintf(writer, "    return %s.size() * %d;\n", declaration.Item, declaration.ItemCount)
 				fmt.Fprintln(writer, "  }")
+				fmt.Fprintln(writer, `  toObject() {`)
+				fmt.Fprintln(writer, `    const len=this.size();`)
+				fmt.Fprintln(writer, `    var rv=[];`)
+				fmt.Fprintln(writer, `    for(var i=0;i<len;i++) {`)
+				fmt.Fprintln(writer, `      rv.push(this.indexAt(i).toObject());`)
+				fmt.Fprintln(writer, `    }`)
+				fmt.Fprintln(writer, `    return rv;`)
+				fmt.Fprintln(writer, `  }`)
 			}
 		case "fixvec":
 			if declaration.Item == "byte" {
-				fmt.Fprintln(writer, "  validate(compatible = false) {")
+				fmt.Fprintln(writer, "  validate(_compatible) {")
 				fmt.Fprintln(writer, "    if (this.view.byteLength < 4) {")
 				fmt.Fprintln(writer, "      dataLengthError(this.view.byteLength, \">4\")")
 				fmt.Fprintln(writer, "    }")
@@ -223,6 +288,9 @@ function serializeTable(buffers) {
 				fmt.Fprintln(writer, "    return this.view.getUint8(4 + i);")
 				fmt.Fprintln(writer, "  }")
 				fmt.Fprintln(writer)
+				fmt.Fprintln(writer, "  toObject() {")
+				fmt.Fprintln(writer, "    return Buffer.from(this.raw()).toString('hex');")
+				fmt.Fprintln(writer, "  }");
 			} else {
 				fmt.Fprintln(writer, "  validate(compatible = false) {")
 				fmt.Fprintln(writer, "    if (this.view.byteLength < 4) {")
@@ -240,6 +308,14 @@ function serializeTable(buffers) {
 				fmt.Fprintf(writer, "    return new %s(this.view.buffer.slice(4 + i * %s.size(), 4 + (i + 1) * %s.size()), { validate: false });\n", declaration.Item, declaration.Item, declaration.Item)
 				fmt.Fprintln(writer, "  }")
 				fmt.Fprintln(writer)
+				fmt.Fprintln(writer, `  toObject() {`)
+				fmt.Fprintln(writer, `    const len=this.length();`)
+				fmt.Fprintln(writer, `    var rv=[];`)
+				fmt.Fprintln(writer, `    for(var i=0;i<len;i++) {`)
+				fmt.Fprintln(writer, `      rv.push(this.indexAt(i).toObject());`)
+				fmt.Fprintln(writer, `    }`)
+				fmt.Fprintln(writer, `    return rv;`)
+				fmt.Fprintln(writer, `  }`)
 			}
 			fmt.Fprintln(writer, "  length() {")
 			fmt.Fprintln(writer, "    return this.view.getUint32(0, true);")
@@ -278,10 +354,22 @@ function serializeTable(buffers) {
 			fmt.Fprintf(writer, `  static size() {
     return %s;
   }`+"\n", strings.Join(sizes, " + "))
+                        fmt.Fprintln(writer, "  toObject() {")
+                        fmt.Fprintln(writer, "    let obj={};")
+			for _, field := range declaration.Fields {
+				if field.Type == "byte" {
+					fmt.Fprintf(writer, `    obj["%s"]=this.%s();`, field.Name, strcase.ToLowerCamel(fmt.Sprintf("get_%s", field.Name)))
+				} else {
+					fmt.Fprintf(writer, `    obj["%s"]=this.%s().toObject();`, field.Name, strcase.ToLowerCamel(fmt.Sprintf("get_%s", field.Name)))
+				}
+				fmt.Fprintln(writer, "");
+			}
+			fmt.Fprintln(writer, "    return obj;")
+			fmt.Fprintln(writer, "  }")
 		case "dynvec":
-			fmt.Fprintf(writer, `  validate(compatible = false) {
+			fmt.Fprintf(writer, `  validate(_compatible) {
     const offsets = verifyAndExtractOffsets(this.view, 0, true);
-    for (let i = 0; i < len(offsets) - 1; i++) {
+    for (let i = 0; i < offsets.length - 1; i++) {
       new %s(this.view.buffer.slice(offsets[i], offsets[i + 1]), { validate: false }).validate();
     }
   }
@@ -303,8 +391,16 @@ function serializeTable(buffers) {
     }
     return new %s(this.view.buffer.slice(offset, offset_end), { validate: false });
   }`+"\n", declaration.Item, declaration.Item)
+                        fmt.Fprintln(writer, `  toObject() {`)
+                        fmt.Fprintln(writer, `    const len=this.length();`)
+                        fmt.Fprintln(writer, `    var rv=[];`)
+                        fmt.Fprintln(writer, `    for(var i=0;i<len;i++) {`)
+                        fmt.Fprintln(writer, `      rv.push(this.indexAt(i).toObject());`)
+                        fmt.Fprintln(writer, `    }`)
+                        fmt.Fprintln(writer, `    return rv;`)
+                        fmt.Fprintln(writer, `  }`)
 		case "table":
-			fmt.Fprintln(writer, `  validate(compatible = false) {
+			fmt.Fprintln(writer, `  validate(_compatible) {
     const offsets = verifyAndExtractOffsets(this.view, 0, true);`)
 			for i, field := range declaration.Fields {
 				if field.Type == "byte" {
@@ -339,9 +435,21 @@ function serializeTable(buffers) {
 					fmt.Fprintln(writer)
 				}
 			}
+                        fmt.Fprintln(writer, "  toObject() {")
+                        fmt.Fprintln(writer, "    let obj={};")
+			for _, field := range declaration.Fields {
+				if field.Type == "byte" {
+					fmt.Fprintf(writer, `    obj["%s"]=this.%s();`, field.Name, strcase.ToLowerCamel(fmt.Sprintf("get_%s", field.Name)))
+				} else {
+					fmt.Fprintf(writer, `    obj["%s"]=this.%s().toObject();`, field.Name, strcase.ToLowerCamel(fmt.Sprintf("get_%s", field.Name)))
+				}
+				fmt.Fprintln(writer, "");
+			}
+			fmt.Fprintln(writer, "    return obj;")
+			fmt.Fprintln(writer, "  }")
 		case "option":
 			if declaration.Item == "byte" {
-				fmt.Fprintln(writer, `  validate(compatible = false) {
+				fmt.Fprintln(writer, `  validate(_compatible) {
     if (this.view.byteLength !== 0 && this.view.byteLength !== 1) {
       throw new Error(`+"`"+`Option that stores byte can only be of length 0 or 1! Actual: ${this.view.byteLength}`+"`"+`);
     }
@@ -351,6 +459,9 @@ function serializeTable(buffers) {
     return this.view.getUint8(0);
   }`)
 				fmt.Fprintln(writer)
+				fmt.Fprintln(writer, "  toObject() {")
+				fmt.Fprintln(writer, "    if(this.hasValue()) return this.value();")
+				fmt.Fprintln(writer, "  }");
 			} else {
 				fmt.Fprintln(writer, `  validate(compatible = false) {
     if (this.hasValue()) {
@@ -362,6 +473,10 @@ function serializeTable(buffers) {
     return new %s(this.view.buffer, { validate: false });
   }`+"\n", declaration.Item)
 				fmt.Fprintln(writer)
+				fmt.Fprintln(writer, "  toObject() {")
+				fmt.Fprintln(writer, "    if(this.hasValue()) return this.value().toObject();")
+				fmt.Fprintln(writer, "    return null;")
+				fmt.Fprintln(writer, "  }");
 			}
 			fmt.Fprintln(writer, `  hasValue() {
     return this.view.byteLength > 0;
@@ -380,7 +495,7 @@ function serializeTable(buffers) {
       break;`+"\n", i)
 				} else {
 					fmt.Fprintf(writer, `    case %d:
-      new %s(this.view.buffer.slice(4), { validate: false }).validate();
+      new %s(this.view.buffer.slice(4), { validate: false }).validate(compatible);
       break;`+"\n",
 						i, item)
 				}
@@ -418,6 +533,9 @@ function serializeTable(buffers) {
       throw new Error(`+"`"+`Invalid type: ${t}`+"`"+`);
     }
   }`)
+			fmt.Fprintln(writer, "  toObject() {")
+			fmt.Fprintln(writer, "    return this;")
+			fmt.Fprintln(writer, "  }");
 		default:
 			return fmt.Errorf("Invalid declaration type: %s", declaration.Type)
 		}
@@ -425,12 +543,41 @@ function serializeTable(buffers) {
 		fmt.Fprintln(writer)
 
 		fmt.Fprintf(writer, "export function Serialize%s(value) {\n", declaration.Name)
+		fmt.Fprintln(writer, `  if(typeof value === "object" && value !== null && "view" in value) return value.view.buffer;`);
 		switch declaration.Type {
 		case "array":
 			if declaration.Item == "byte" {
-				fmt.Fprintln(writer, "  const buffer = assertArrayBuffer(value);")
-				fmt.Fprintf(writer, "  assertDataLength(buffer.byteLength, %d);\n", declaration.ItemCount)
-				fmt.Fprintln(writer, "  return buffer;")
+				fmt.Fprintln(writer, "  switch(typeof value) {")
+				fmt.Fprintln(writer, "  case \"number\":")
+				switch declaration.ItemCount {
+				case 2:
+					fmt.Fprintf(writer,  "    var tmp = new ArrayBuffer(%d);\n", declaration.ItemCount)
+					fmt.Fprintln(writer, "    var tmpDV = new DataView(tmp);")
+					fmt.Fprintln(writer, "    tmpDV.setInt16(0, value, true);")
+					fmt.Fprintln(writer, "    return tmp;")
+				case 4:
+					fmt.Fprintf(writer,  "    var tmp = new ArrayBuffer(%d);\n", declaration.ItemCount)
+					fmt.Fprintln(writer, "    var tmpDV = new DataView(tmp);")
+					fmt.Fprintln(writer, "    tmpDV.setInt32(0, value, true);")
+					fmt.Fprintln(writer, "    return tmp;")
+				default:
+					fmt.Fprintln(writer, "    throw new Error(\"Can't accept numbers for unusual byte arrays\");")
+				}
+				fmt.Fprintln(writer, "  default: {")
+				switch declaration.ItemCount {
+				case 2:
+					fmt.Fprintln(writer, "      const buffer = assertArrayBuffer(value, 2);")
+				case 4:
+					fmt.Fprintln(writer, "      const buffer = assertArrayBuffer(value, 4);")
+				case 8:
+					fmt.Fprintln(writer, "      const buffer = assertArrayBuffer(value, 8);")
+				default:
+					fmt.Fprintln(writer, "      const buffer = assertArrayBuffer(value);")
+				}
+				fmt.Fprintf(writer,  "      assertDataLength(buffer.byteLength, %d);\n", declaration.ItemCount)
+				fmt.Fprintln(writer, "      return buffer;")
+				fmt.Fprintln(writer, "    }")
+				fmt.Fprintln(writer, "  }")
 			} else {
 				fmt.Fprintf(writer, "  const array = new Uint8Array(%s.size() * value.length);\n", declaration.Item)
 				fmt.Fprintln(writer, "  for (let i = 0; i < value.length; i++) {")
@@ -465,11 +612,11 @@ function serializeTable(buffers) {
 				}
 			}
 			fmt.Fprintf(writer, "  const array = new Uint8Array(%s);\n", strings.Join(sizes, " + "))
-			fmt.Fprintln(writer, "  const view = new DataView(array.buffer);")
 			sizes = []string{"0"}
 			for _, field := range declaration.Fields {
 				if field.Type == "byte" {
-					fmt.Fprintf(writer, "  view.setUint8(%s, value.%s);\n", strings.Join(sizes, " + "), field.Name)
+					fmt.Fprintln(writer, "  const view = new DataView(array.buffer);")
+					fmt.Fprintf(writer, "  view.setUint8(%s, fromStringEnum(value.%s));\n", strings.Join(sizes, " + "), field.Name)
 					sizes = append(sizes, "1")
 				} else {
 					fmt.Fprintf(writer, "  array.set(new Uint8Array(Serialize%s(value.%s)), %s);\n", field.Type, field.Name, strings.Join(sizes, " + "))
@@ -485,7 +632,7 @@ function serializeTable(buffers) {
 				camelCaseName := strcase.ToLowerCamel(field.Name)
 				if field.Type == "byte" {
 					fmt.Fprintf(writer, `  const %sView = new DataView(new ArrayBuffer(1));
-  %sView.setUint8(0, value.%s);
+  %sView.setUint8(0, fromStringEnum(value.%s));
   buffers.push(%sView.buffer)`+"\n", camelCaseName, camelCaseName, field.Name, camelCaseName)
 				} else {
 					fmt.Fprintf(writer, "  buffers.push(Serialize%s(value.%s));\n", field.Type, field.Name)
@@ -545,26 +692,62 @@ function serializeTable(buffers) {
 }
 
 func doGenerateDefinition(options Options, schema Schema, writer *innerWriter) error {
-	fmt.Fprintln(writer, `export interface CastToArrayBuffer {
+	fmt.Fprintln(writer, `// @flow`);
+	fmt.Fprintln(writer, `/* istanbul ignore file */`);
+	fmt.Fprintln(writer, `type byteJSON = number;
+export interface CastToArrayBuffer {
   toArrayBuffer(): ArrayBuffer;
 }
 
-export type CanCastToArrayBuffer = ArrayBuffer | CastToArrayBuffer;
+export type CanCastToArrayBuffer = ArrayBuffer | CastToArrayBuffer | string;
 
 export interface CreateOptions {
   validate?: boolean;
 }
 
-export interface UnionType {
+export interface UnionType<T> {
   type: string;
-  value: any;
+  value: T;
 }`)
 	fmt.Fprintln(writer)
 	for _, declaration := range schema.Declarations {
 		switch declaration.Type {
 		case "array":
 			if declaration.Item == "byte" {
-				fmt.Fprintf(writer, "export function Serialize%s(value: CanCastToArrayBuffer): ArrayBuffer;\n", declaration.Name)
+				switch declaration.ItemCount {
+				case 2,4:
+					fmt.Fprintf(writer, "type %sJSON = number;\n", declaration.Name)
+				case 8:
+					if(options.HasBigInt) {
+						fmt.Fprintf(writer, "type %sJSON = bigint;\n", declaration.Name)
+					} else {
+						fmt.Fprintf(writer, "type %sJSON = string;\n", declaration.Name)
+					}
+				default:
+					fmt.Fprintf(writer, "type %sJSON = string;\n", declaration.Name)
+				}
+			}	else {
+				fmt.Fprintf(writer, "type %sJSON = %sJSON[];\n", declaration.Name, declaration.Item)
+			}
+		case "fixvec", "dynvec":
+			if declaration.Item == "byte" {
+				fmt.Fprintf(writer, "type %sJSON = string;\n", declaration.Name)
+			}	else {
+				fmt.Fprintf(writer, "type %sJSON = %sJSON[];\n", declaration.Name, declaration.Item)
+			}
+		case "struct", "table":
+			fmt.Fprintf(writer, "export interface %sJSON {\n", declaration.Name)
+			for _, field := range declaration.Fields {
+				fmt.Fprintf(writer, "  %s: %sJSON;\n", strcase.ToLowerCamel(field.Name), field.Type);
+			}
+			fmt.Fprintln(writer, "}")
+		case "option":
+			fmt.Fprintf(writer, "type %sJSON = %sJSON | undefined;\n", declaration.Name, declaration.Item)
+		}
+		switch declaration.Type {
+		case "array":
+			if declaration.Item == "byte" {
+			        fmt.Fprintf(writer, declareSerializeWithWrapping(declaration.Name, "CanCastToArrayBuffer"))
 				fmt.Fprintf(writer, "export class %s {\n", declaration.Name)
 				fmt.Fprintln(writer, "  constructor(reader: CanCastToArrayBuffer, options?: CreateOptions);")
 				fmt.Fprintln(writer, "  validate(compatible?: boolean): void;")
@@ -583,52 +766,54 @@ export interface UnionType {
 						fmt.Fprintln(writer, "  toLittleEndianUint64(): BigInt;")
 					}
 				}
-				fmt.Fprintln(writer, "  static size(): Number;")
+				fmt.Fprintln(writer, "  static size(): number;")
+				fmt.Fprintf(writer, "  toObject(): %sJSON;\n", declaration.Name);
 				fmt.Fprintln(writer, "}")
 			} else {
 				childType, err := querySerializingValueType(schema, declaration.Item)
 				if err != nil {
 					return err
 				}
-				fmt.Fprintf(writer, "export function Serialize%s(value: Array<%s>): ArrayBuffer;\n", declaration.Name, childType)
+				fmt.Fprintf(writer, declareSerializeWithWrapping(declaration.Name, fmt.Sprintf("Array<%s>", childType)))
 				fmt.Fprintf(writer, "export class %s {\n", declaration.Name)
 				fmt.Fprintln(writer, "  constructor(reader: CanCastToArrayBuffer, options?: CreateOptions);")
 				fmt.Fprintln(writer, "  validate(compatible?: boolean): void;")
 				fmt.Fprintf(writer, "  indexAt(i: number): %s;\n", declaration.Item)
-				fmt.Fprintln(writer, "  static size(): Number;")
+				fmt.Fprintln(writer, "  static size(): number;")
+				fmt.Fprintf(writer, "  toObject(): %sJSON;\n", declaration.Name);
 				fmt.Fprintln(writer, "}")
 			}
-			fmt.Fprintln(writer)
 		case "fixvec":
 			if declaration.Item == "byte" {
-				fmt.Fprintf(writer, "export function Serialize%s(value: CanCastToArrayBuffer): ArrayBuffer;\n", declaration.Name)
+			        fmt.Fprintf(writer, declareSerializeWithWrapping(declaration.Name, "CanCastToArrayBuffer"))
 				fmt.Fprintf(writer, "export class %s {\n", declaration.Name)
 				fmt.Fprintln(writer, "  constructor(reader: CanCastToArrayBuffer, options?: CreateOptions);")
 				fmt.Fprintln(writer, "  validate(compatible?: boolean): void;")
 				fmt.Fprintln(writer, "  indexAt(i: number): number;")
 				fmt.Fprintln(writer, "  raw(): ArrayBuffer;")
 				fmt.Fprintln(writer, "  length(): number;")
+				fmt.Fprintf(writer, "  toObject(): %sJSON;\n", declaration.Name);
 				fmt.Fprintln(writer, "}")
 			} else {
 				childType, err := querySerializingValueType(schema, declaration.Item)
 				if err != nil {
 					return err
 				}
-				fmt.Fprintf(writer, "export function Serialize%s(value: Array<%s>): ArrayBuffer;\n", declaration.Name, childType)
+				fmt.Fprintf(writer, declareSerializeWithWrapping(declaration.Name, fmt.Sprintf("Array<%s>", childType)))
 				fmt.Fprintf(writer, "export class %s {\n", declaration.Name)
 				fmt.Fprintln(writer, "  constructor(reader: CanCastToArrayBuffer, options?: CreateOptions);")
 				fmt.Fprintln(writer, "  validate(compatible?: boolean): void;")
 				fmt.Fprintf(writer, "  indexAt(i: number): %s;\n", declaration.Item)
 				fmt.Fprintln(writer, "  length(): number;")
+				fmt.Fprintf(writer, "  toObject(): %sJSON;\n", declaration.Name);
 				fmt.Fprintln(writer, "}")
 			}
-			fmt.Fprintln(writer)
 		case "struct":
-			fmt.Fprintf(writer, "export function Serialize%s(value: object): ArrayBuffer;\n", declaration.Name)
+			fmt.Fprintf(writer, declareSerializeWithWrapping(declaration.Name, fmt.Sprintf("%sJSON", declaration.Name)))
 			fmt.Fprintf(writer, "export class %s {\n", declaration.Name)
 			fmt.Fprintln(writer, "  constructor(reader: CanCastToArrayBuffer, options?: CreateOptions);")
 			fmt.Fprintln(writer, "  validate(compatible?: boolean): void;")
-			fmt.Fprintln(writer, "  static size(): Number;")
+			fmt.Fprintln(writer, "  static size(): number;")
 			for _, field := range declaration.Fields {
 				if field.Type == "byte" {
 					fmt.Fprintf(writer, "  %s(): number;\n", strcase.ToLowerCamel(fmt.Sprintf("get_%s", field.Name)))
@@ -636,23 +821,23 @@ export interface UnionType {
 					fmt.Fprintf(writer, "  %s(): %s;\n", strcase.ToLowerCamel(fmt.Sprintf("get_%s", field.Name)), field.Type)
 				}
 			}
+			fmt.Fprintf(writer, "  toObject(): %sJSON;\n", declaration.Name);
 			fmt.Fprintln(writer, "}")
-			fmt.Fprintln(writer)
 		case "dynvec":
 			childType, err := querySerializingValueType(schema, declaration.Item)
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(writer, "export function Serialize%s(value: Array<%s>): ArrayBuffer;\n", declaration.Name, childType)
+			fmt.Fprintf(writer, declareSerializeWithWrapping(declaration.Name, fmt.Sprintf("Array<%s>", childType)))
 			fmt.Fprintf(writer, "export class %s {\n", declaration.Name)
 			fmt.Fprintln(writer, "  constructor(reader: CanCastToArrayBuffer, options?: CreateOptions);")
 			fmt.Fprintln(writer, "  validate(compatible?: boolean): void;")
 			fmt.Fprintf(writer, "  indexAt(i: number): %s;\n", declaration.Item)
 			fmt.Fprintln(writer, "  length(): number;")
+			fmt.Fprintf(writer, "  toObject(): %sJSON;\n", declaration.Name);
 			fmt.Fprintln(writer, "}")
-			fmt.Fprintln(writer)
 		case "table":
-			fmt.Fprintf(writer, "export function Serialize%s(value: object): ArrayBuffer;\n", declaration.Name)
+			fmt.Fprintf(writer, declareSerializeWithWrapping(declaration.Name, fmt.Sprintf("%sJSON", declaration.Name)))
 			fmt.Fprintf(writer, "export class %s {\n", declaration.Name)
 			fmt.Fprintln(writer, "  constructor(reader: CanCastToArrayBuffer, options?: CreateOptions);")
 			fmt.Fprintln(writer, "  validate(compatible?: boolean): void;")
@@ -663,45 +848,55 @@ export interface UnionType {
 					fmt.Fprintf(writer, "  %s(): %s;\n", strcase.ToLowerCamel(fmt.Sprintf("get_%s", field.Name)), field.Type)
 				}
 			}
+			fmt.Fprintf(writer, "  toObject(): %sJSON;\n", declaration.Name);
 			fmt.Fprintln(writer, "}")
-			fmt.Fprintln(writer)
 		case "option":
 			if declaration.Item == "byte" {
-				fmt.Fprintf(writer, "export function Serialize%s(value: number | null): ArrayBuffer;\n", declaration.Name)
+			        fmt.Fprintf(writer, declareSerializeWithWrapping(declaration.Name, "number | null"))
 				fmt.Fprintf(writer, "export class %s {\n", declaration.Name)
 				fmt.Fprintln(writer, "  constructor(reader: CanCastToArrayBuffer, options?: CreateOptions);")
 				fmt.Fprintln(writer, "  validate(compatible?: boolean): void;")
 				fmt.Fprintln(writer, "  value(): number;")
 				fmt.Fprintln(writer, "  hasValue(): boolean;")
+				fmt.Fprintf(writer, "  toObject(): %sJSON;\n", declaration.Name);
 				fmt.Fprintln(writer, "}")
 			} else {
 				childType, err := querySerializingValueType(schema, declaration.Item)
 				if err != nil {
 					return err
 				}
-				fmt.Fprintf(writer, "export function Serialize%s(value: %s | null): ArrayBuffer;\n", declaration.Name, childType)
+			        fmt.Fprintf(writer, declareSerializeWithWrapping(declaration.Name, childType))
 				fmt.Fprintf(writer, "export class %s {\n", declaration.Name)
 				fmt.Fprintln(writer, "  constructor(reader: CanCastToArrayBuffer, options?: CreateOptions);")
 				fmt.Fprintln(writer, "  validate(compatible?: boolean): void;")
 				fmt.Fprintf(writer, "  value(): %s;\n", declaration.Item)
 				fmt.Fprintln(writer, "  hasValue(): boolean;")
+				fmt.Fprintf(writer, "  toObject(): %sJSON;\n", declaration.Name);
 				fmt.Fprintln(writer, "}")
 			}
-			fmt.Fprintln(writer)
 		case "union":
-			fmt.Fprintf(writer, "export function Serialize%s(value: UnionType): ArrayBuffer;\n", declaration.Name)
+			fmt.Fprintf(writer, declareSerializeWithWrapping(declaration.Name, "UnionType"))
 			fmt.Fprintf(writer, "export class %s {\n", declaration.Name)
 			fmt.Fprintln(writer, "  constructor(reader: CanCastToArrayBuffer, options?: CreateOptions);")
 			fmt.Fprintln(writer, "  validate(compatible?: boolean): void;")
 			fmt.Fprintf(writer, "  unionType(): string;\n")
 			fmt.Fprintln(writer, "  value(): any;")
+			fmt.Fprintf(writer, "  toObject(): %sJSON;\n", declaration.Name);
 			fmt.Fprintln(writer, "}")
-			fmt.Fprintln(writer)
 		default:
 			fmt.Fprintf(writer, "// TODO: generate definitions for %s, type: %s\n\n", declaration.Name, declaration.Type)
 		}
 	}
 	return nil
+}
+
+func declareSerializeWithWrapping(name string, inputType string) string {
+	short := fmt.Sprintf("export function Serialize%s(value: %s): ArrayBuffer;\n", name, inputType)
+	if(len(short)>82) {
+	    return fmt.Sprintf("export function Serialize%s(\n  value: %s\n): ArrayBuffer;\n", name, inputType)
+	} else {
+		return short
+	}
 }
 
 func querySerializingValueType(schema Schema, itemName string) (string, error) {
@@ -731,8 +926,7 @@ func querySerializingValueType(schema Schema, itemName string) (string, error) {
 	case "struct":
 		fallthrough
 	case "table":
-		// TODO: see if we can generate a more static type later.
-		return "object", nil
+		return fmt.Sprintf("%sJSON", declaration.Name), nil
 	case "option":
 		return "number | null", nil
 	case "union":
